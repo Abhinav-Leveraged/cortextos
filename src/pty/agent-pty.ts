@@ -153,9 +153,49 @@ export class AgentPTY {
 
     this._alive = true;
 
-    // Set up output capture
+    // Claude Code can show two first-run gates before the agent is usable:
+    //  1. The "Bypass Permissions mode" warning (shown on EVERY spawn that uses
+    //     --dangerously-skip-permissions in current Claude Code — the global
+    //     bypassPermissionsModeAccepted flag does NOT suppress it). Its default
+    //     cursor sits on "1. No, exit", so a bare Enter EXITS the process
+    //     (code 1) and the agent crash-loops. We must arrow DOWN to
+    //     "2. Yes, I accept" before confirming.
+    //  2. The "trust this folder?" prompt on first run in a new directory,
+    //     whose default IS the accept option — a bare Enter accepts it.
+    // The screens render at unpredictable times (slower under load, and on
+    // cron-triggered --continue spawns), so we drive the handler REACTIVELY
+    // from the output stream — responding the instant the prompt text arrives —
+    // rather than guessing with fixed timers. Each gate is handled at most once
+    // so repeated key presses can't toggle the selection back off "accept".
+    // A short debounce lets the full option list render before we navigate, and
+    // a sparse timer schedule remains as a belt-and-suspenders fallback.
+    let bypassHandled = false;
+    let bypassArmed = false;
+    let trustHandled = false;
+    const acceptBypass = () => {
+      if (bypassHandled || !this.pty) return;
+      bypassHandled = true;
+      this.pty.write('\x1b[B'); // arrow down: "1. No, exit" -> "2. Yes, I accept"
+      this.pty.write('\r');     // confirm acceptance
+    };
+    const handleFirstRunGates = () => {
+      if (!this.pty) return;
+      const recent = this.outputBuffer.getRecent();
+      if (!bypassHandled && recent.includes('Bypass Permissions')) {
+        // Defer the keypress briefly so the option list has fully rendered.
+        if (!bypassArmed) { bypassArmed = true; setTimeout(acceptBypass, 400); }
+        return;
+      }
+      if (!trustHandled && recent.includes('trust')) {
+        this.pty.write('\r'); // trust dialog default is the accept option
+        trustHandled = true;
+      }
+    };
+
+    // Set up output capture — also drives the first-run gate handler reactively.
     this.pty.onData((data: string) => {
       this.outputBuffer.push(data);
+      if (!bypassHandled || !trustHandled) handleFirstRunGates();
     });
 
     // Set up exit handler
@@ -167,34 +207,8 @@ export class AgentPTY {
       }
     });
 
-    // Claude Code can show two first-run gates before the agent is usable:
-    //  1. The "Bypass Permissions mode" warning (shown whenever the agent is
-    //     launched with --dangerously-skip-permissions, even after the global
-    //     bypassPermissionsModeAccepted flag is set). Its default cursor sits
-    //     on "1. No, exit" — so a bare Enter EXITS the process (code 1) and the
-    //     agent crash-loops. We must arrow DOWN to "2. Yes, I accept" first.
-    //  2. The "trust this folder?" prompt on first run in a new directory,
-    //     whose default IS the accept option — a bare Enter accepts it.
-    // Both render a few seconds after spawn. Retry on a short schedule and
-    // handle each screen at most once, so repeated key presses can't toggle
-    // the selection back off the accept option.
-    let bypassHandled = false;
-    let trustHandled = false;
-    const handleFirstRunGates = () => {
-      if (!this.pty) return;
-      const recent = this.outputBuffer.getRecent();
-      if (!bypassHandled && recent.includes('Bypass Permissions')) {
-        this.pty.write('\x1b[B'); // arrow down: "1. No, exit" -> "2. Yes, I accept"
-        this.pty.write('\r');     // confirm acceptance
-        bypassHandled = true;
-        return; // give the next tick a chance to clear any trust prompt
-      }
-      if (!trustHandled && recent.includes('trust')) {
-        this.pty.write('\r'); // trust dialog default is the accept option
-        trustHandled = true;
-      }
-    };
-    for (const delay of [4000, 6000, 8000, 11000, 14000]) {
+    // Fallback in case the gate text never triggers an onData tick we observed.
+    for (const delay of [3000, 6000, 10000, 15000, 22000, 30000]) {
       setTimeout(handleFirstRunGates, delay);
     }
   }
